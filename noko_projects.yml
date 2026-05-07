@@ -1,0 +1,16 @@
+# Noko project mappings
+# Format: "Noko Project Name": "TICKET-PREFIX"
+# Leave blank if no ticket prefix / no repo for that project
+
+projects:
+  "dev-tooling":
+  "Donut":
+  "Fixers Guild": "OMBO"
+  "Free Automated Roadmap":
+  "Is it Ruby or Rails":
+  "Learning":
+  "Ombots": "AUT"
+  "OmbuLabs Blog Redesign":
+  "Onboarding":
+  "Open Source":
+  "Operations":
