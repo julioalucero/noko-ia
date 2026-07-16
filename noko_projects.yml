@@ -2,6 +2,15 @@
 # Format: "Noko Project Name": "TICKET-PREFIX"
 # Leave blank if no ticket prefix / no repo for that project
 
+# Browser history: only URLs whose host contains one of these strings are
+# treated as "work" activity. Everything else (x.com, youtube, etc.) is ignored.
+browser_domains:
+  - atlassian.net
+  - github.com
+  - nokotime
+  - localhost
+  - slite
+
 projects:
   "dev-tooling":
   "Donut":

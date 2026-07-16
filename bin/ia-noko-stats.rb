@@ -1,5 +1,7 @@
 #!/usr/bin/env ruby
-# Usage: ruby bin/ia-noko-stats.rb MM-DD-YY [TARGET_HOURS]
+# Usage: ruby bin/ia-noko-stats.rb [MM-DD-YY] [TARGET_HOURS]
+# Defaults: today's date and 8 hours when omitted
+# Example: ruby bin/ia-noko-stats.rb                 # today, 8h
 # Example: ruby bin/ia-noko-stats.rb 04-28-26 8
 # Example: ruby bin/ia-noko-stats.rb 04-28-26 7.5
 
@@ -22,7 +24,7 @@ if File.exist?(env_file)
 end
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATE_ARG    = ARGV[0] or abort "Usage: #{$0} MM-DD-YY [TARGET_HOURS]"
+DATE_ARG    = ARGV[0] || Date.today.strftime("%m-%d-%y")
 TARGET_ARG  = ARGV[1]
 MAX_GAP     = 90  # minutes — gaps larger than this are ignored (lunch/break)
 CONFIG_FILE = File.expand_path("noko_projects.yml", File.dirname(__dir__))
@@ -43,11 +45,13 @@ target_minutes = (target_hours * 60).round
 
 # Load project mappings: { "TICKET_PREFIX" => "Noko Project Name" }
 PREFIX_TO_PROJECT = {}
+BROWSER_DOMAINS = []
 if File.exist?(CONFIG_FILE)
   config = YAML.load_file(CONFIG_FILE)
   (config["projects"] || {}).each do |project, prefix|
     PREFIX_TO_PROJECT[prefix.upcase] = project if prefix
   end
+  BROWSER_DOMAINS.concat(Array(config["browser_domains"]).compact.map(&:to_s))
 else
   warn "⚠️  Config file not found: #{CONFIG_FILE}"
 end
@@ -94,7 +98,9 @@ if File.exist?(zsh_history)
     f.each_line do |line|
       next unless line =~ /^:\s*(\d+):(\d+);(.+)/
       ts  = $1.to_i
-      cmd = $3.strip
+      # zsh_history is read as ASCII-8BIT; scrub to valid UTF-8 so the prompt
+      # can be JSON-encoded later (commands may contain unicode bytes).
+      cmd = $3.strip.force_encoding("UTF-8").scrub("")
       next unless ts >= day_start && ts < day_end
       shell_entries << { ts: ts, cmd: cmd, source: "shell" }
     end
@@ -136,8 +142,64 @@ end
 
 puts "📦  Found #{git_entries.size} git commits"
 
+# ── Read Brave browser history for that day ───────────────────────────────────
+# Reads page visits from the local SQLite history DB (Chromium schema).
+# Only hosts matching BROWSER_DOMAINS are kept; titles are deduped to one entry
+# per title per 15-minute window so reloads/tabs don't spam the timeline.
+browser_entries = []
+brave_db = File.expand_path(
+  "~/Library/Application Support/BraveSoftware/Brave-Browser/Default/History"
+)
+
+if File.exist?(brave_db) && !BROWSER_DOMAINS.empty? && system("which sqlite3 > /dev/null 2>&1")
+  # Brave locks the DB while running, so query a copy.
+  tmp_db = "/tmp/noko-brave-#{parsed.strftime("%Y%m%d")}.db"
+  if system("cp", brave_db, tmp_db)
+    # Chromium stores timestamps as microseconds since 1601-01-01 (WebKit epoch).
+    # Note the single-quoted '' for the empty string: in SQLite "" is an
+    # identifier, not a string literal.
+    query = <<~SQL
+      SELECT v.visit_time/1000000 - 11644473600 AS unixts, u.url, u.title
+      FROM visits v JOIN urls u ON u.id = v.url
+      WHERE v.visit_time/1000000 - 11644473600 >= #{day_start}
+        AND v.visit_time/1000000 - 11644473600 <  #{day_end}
+        AND u.title IS NOT NULL AND u.title != ''
+      ORDER BY v.visit_time;
+    SQL
+
+    # Feed the query over stdin so no SQL ever passes through the shell
+    # (the '' empty-string literal would break shell single-quoting).
+    raw = IO.popen(["sqlite3", "-separator", "\t", tmp_db], "r+") do |io|
+      io.puts query
+      io.close_write
+      io.read
+    end
+
+    seen = {}
+    raw.to_s.each_line do |line|
+      ts_str, url, title = line.chomp.split("\t", 3)
+      next unless url && title
+      ts = ts_str.to_i
+
+      host = url[%r{\Ahttps?://([^/]+)}, 1].to_s
+      next unless BROWSER_DOMAINS.any? { |d| host.include?(d) }
+
+      key = [title, ts / 900] # one entry per title per 15-min bucket
+      next if seen[key]
+      seen[key] = true
+
+      browser_entries << { ts: ts, cmd: "#{title} (#{host})", source: "browser" }
+    end
+
+    File.delete(tmp_db) if File.exist?(tmp_db)
+  end
+end
+
+puts "🌐  Found #{browser_entries.size} browser visits"
+
 # ── Merge and sort all entries ────────────────────────────────────────────────
-all_entries = (shell_entries + git_entries).sort_by { |e| e[:ts] }.uniq { |e| e[:ts] }
+all_entries = (shell_entries + git_entries + browser_entries)
+              .sort_by { |e| e[:ts] }.uniq { |e| e[:ts] }
 
 if all_entries.empty?
   puts "\n😶  No activity found for #{date_label}."
@@ -157,7 +219,11 @@ puts ""
 # ── Format history for Claude ─────────────────────────────────────────────────
 history_text = all_entries.map do |e|
   time = Time.at(e[:ts]).strftime("%H:%M")
-  src  = e[:source] == "git" ? "[commit]" : "[shell] "
+  src  = case e[:source]
+         when "git"     then "[commit] "
+         when "browser" then "[browser]"
+         else "[shell]  "
+         end
   "#{time}  #{src}  #{e[:cmd]}"
 end.join("\n")
 
@@ -166,7 +232,7 @@ projects_list = PREFIX_TO_PROJECT.map { |prefix, project| "#{prefix}-XXXX => #{p
 prompt = <<~PROMPT
   You are helping log work hours into Noko time tracking for a software developer named Julio.
 
-  Here is the activity for #{date_label} (shell commands + git commits):
+  Here is the activity for #{date_label} (shell commands + git commits + browser page visits):
   #{history_text}
 
   Total estimated active time: #{format_time(total_minutes)}
@@ -198,7 +264,7 @@ prompt = <<~PROMPT
   - Total time should add up exactly to #{format_time(target_minutes)}
   - Always include an Operations entry of at least 0:30 for standup/email if there's no other operations activity
 
-  Return ONLY a JSON array, no markdown, no explanation. Each entry:
+  Return a JSON object with an "entries" array. Each entry:
   - "time": H:MM format
   - "project": Noko project name from the mappings
   - "description": short natural description in Julio's style
@@ -217,8 +283,33 @@ request["x-api-key"]         = ENV["ANTHROPIC_API_KEY"]
 request["anthropic-version"] = "2023-06-01"
 
 request.body = JSON.generate({
-  model: "claude-sonnet-4-20250514",
+  model: "claude-sonnet-4-6",
   max_tokens: 1000,
+  output_config: {
+    format: {
+      type: "json_schema",
+      schema: {
+        type: "object",
+        properties: {
+          entries: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                time: { type: "string" },
+                project: { type: "string" },
+                description: { type: "string" }
+              },
+              required: ["time", "project", "description"],
+              additionalProperties: false
+            }
+          }
+        },
+        required: ["entries"],
+        additionalProperties: false
+      }
+    }
+  },
   messages: [{ role: "user", content: prompt }]
 })
 
@@ -230,16 +321,18 @@ unless response.code == "200"
 end
 
 raw = data.dig("content", 0, "text").to_s.strip
-raw = raw.gsub(/```json|```/, "").strip
 
 begin
-  entries_out = JSON.parse(raw)
+  parsed = JSON.parse(raw)
 rescue JSON::ParserError
   abort "❌  Could not parse Claude's response:\n#{raw}"
 end
 
+# Structured output returns { "entries": [...] }; tolerate a bare array too
+entries_out = parsed.is_a?(Hash) ? parsed["entries"] : parsed
+
 unless entries_out.is_a?(Array)
-  abort "❌  Claude response was not a JSON array"
+  abort "❌  Claude response did not contain an entries array"
 end
 
 parsed_minutes = entries_out.map { |e| parse_hmm_to_minutes(e["time"]) }
