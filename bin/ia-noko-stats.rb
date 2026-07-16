@@ -27,6 +27,8 @@ end
 DATE_ARG    = ARGV[0] || Date.today.strftime("%m-%d-%y")
 TARGET_ARG  = ARGV[1]
 MAX_GAP     = 90  # minutes — gaps larger than this are ignored (lunch/break)
+DWELL_CAP   = 30 * 60 # seconds — max time credited to a single page view
+GLANCE_MIN  = 2 * 60  # seconds — a single visit under this = a glance, ignored
 CONFIG_FILE = File.expand_path("noko_projects.yml", File.dirname(__dir__))
 BASE_DIR    = File.expand_path("~/projects")
 
@@ -175,27 +177,48 @@ if File.exist?(brave_db) && !BROWSER_DOMAINS.empty? && system("which sqlite3 > /
       io.read
     end
 
-    seen = {}
-    raw.to_s.each_line do |line|
+    # Parse every visit (all sites) so dwell can be bounded by the next visit
+    # to *any* page — glancing at a work page then jumping to x.com dwells ~0.
+    visits = raw.to_s.each_line.map do |line|
       ts_str, url, title = line.chomp.split("\t", 3)
       next unless url && title
-      ts = ts_str.to_i
+      { ts: ts_str.to_i, host: url[%r{\Ahttps?://([^/]+)}, 1].to_s, title: title }
+    end.compact
 
-      host = url[%r{\Ahttps?://([^/]+)}, 1].to_s
-      next unless BROWSER_DOMAINS.any? { |d| host.include?(d) }
+    # Aggregate work visits by title: how many times, and total dwell time.
+    # Dwell per view = time until the next visit, capped (idle tabs don't count).
+    pages = {}
+    visits.each_with_index do |v, i|
+      next unless BROWSER_DOMAINS.any? { |d| v[:host].include?(d) }
 
-      key = [title, ts / 900] # one entry per title per 15-min bucket
-      next if seen[key]
-      seen[key] = true
+      nxt   = visits[i + 1]
+      dwell = nxt ? [nxt[:ts] - v[:ts], DWELL_CAP].min : GLANCE_MIN
+      dwell = 0 if dwell.negative?
 
-      browser_entries << { ts: ts, cmd: "#{title} (#{host})", source: "browser" }
+      p = (pages[v[:title]] ||= { ts: v[:ts], host: v[:host], visits: 0, dwell: 0 })
+      p[:visits] += 1
+      p[:dwell]  += dwell
+      p[:ts] = v[:ts] if v[:ts] < p[:ts] # place on the timeline at first view
+    end
+
+    # Drop glances: a page seen once for less than GLANCE_MIN isn't real work.
+    pages.each do |title, p|
+      next if p[:visits] == 1 && p[:dwell] < GLANCE_MIN
+
+      mins = (p[:dwell] / 60.0).round
+      tag  = "#{p[:visits]}x, #{mins}min"
+      browser_entries << {
+        ts: p[:ts],
+        cmd: "#{title} (#{p[:host]}) [#{tag}]",
+        source: "browser"
+      }
     end
 
     File.delete(tmp_db) if File.exist?(tmp_db)
   end
 end
 
-puts "🌐  Found #{browser_entries.size} browser visits"
+puts "🌐  Found #{browser_entries.size} browser pages (after dropping glances)"
 
 # ── Merge and sort all entries ────────────────────────────────────────────────
 all_entries = (shell_entries + git_entries + browser_entries)
@@ -260,6 +283,9 @@ prompt = <<~PROMPT
   - Group same-ticket work into one entry when possible
   - If multiple tickets are related, combine them: "AUT-340 and AUT-339: description"
   - Tag calls with #calls at the start of the description
+  - [browser] lines end with an engagement tag like [3x, 25min] = visits, time on page.
+    Weight them by that: high visits/minutes means real work; a low tag (e.g. 1x, 3min)
+    is likely just a page you glanced at (someone else's ticket, a link) — don't log it as work.
   - Ignore gaps > #{MAX_GAP} minutes (lunch/breaks)
   - Total time should add up exactly to #{format_time(target_minutes)}
   - Always include an Operations entry of at least 0:30 for standup/email if there's no other operations activity
