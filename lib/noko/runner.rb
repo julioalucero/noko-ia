@@ -51,12 +51,17 @@ module Noko
       git = Sources::Git.new(date_str: date_str, base_dir: BASE_DIR).entries
       puts "📦  Found #{git.size} git commits"
 
+      github = Sources::Github.new(
+        day_start: day_start, day_end: day_end, token: config.github_token
+      ).entries
+      puts "🐙  Found #{github.size} GitHub activity items"
+
       browser = Sources::Browser.new(
         day_start: day_start, day_end: day_end, domains: config.browser_domains
       ).entries
       puts "🌐  Found #{browser.size} browser pages (after dropping glances)"
 
-      shell + git + browser
+      shell + git + github + browser
     end
 
     def parse_date(arg)

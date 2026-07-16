@@ -8,7 +8,8 @@ ruby bin/ia-noko-stats.rb              # today, 8h target
 ruby bin/ia-noko-stats.rb 07-15-26 7.5 # specific day (MM-DD-YY), 7.5h target
 ```
 
-Needs `ANTHROPIC_API_KEY` (loaded from `.env`, gitignored).
+Needs `ANTHROPIC_API_KEY` (loaded from `.env`, gitignored). `GITHUB_TOKEN` is
+optional — without it the GitHub source is skipped.
 
 ## How it works
 
@@ -26,6 +27,7 @@ lib/noko/time_format.rb     H:MM <-> minutes (shared)
 lib/noko/timeline.rb        merge/sort/dedup + total-active-time estimate
 lib/noko/sources/shell.rb   ~/.zsh_history
 lib/noko/sources/git.rb     commits from repos under ~/projects
+lib/noko/sources/github.rb  GitHub events API (reviews/comments/PRs)
 lib/noko/sources/browser.rb Brave history (dwell + glance filtering)
 lib/noko/prompt.rb          builds the Claude prompt
 lib/noko/claude.rb          API call + time balancing
@@ -34,11 +36,18 @@ lib/noko/report.rb          terminal output
 
 ## Key behavior
 
+- **GitHub vs browser split**: the GitHub events API owns code/PR/review
+  activity because it's authoritative — an event means you actually reviewed or
+  commented, whereas a browser visit can't tell "reviewed" from "glanced". So
+  `github.com` is intentionally NOT in `browser_domains`; the browser source
+  covers Jira/docs/localhost only. Commits stay with the local git source
+  (GitHub `PushEvent`s are skipped to avoid duplicating them).
 - **Browser dwell/glance rule** (`sources/browser.rb`): pages are aggregated per
   title with a visit count and total dwell (time until the next visit to any
   page, capped at `DWELL_CAP` = 30 min). A page seen once for under `GLANCE_MIN`
-  = 2 min is dropped as a glance (e.g. a colleague's ticket you opened once).
-  Kept pages carry a `[Nx, Mmin]` tag the prompt tells Claude to weight by.
+  = 2 min is dropped as a glance. Kept pages carry a `[Nx, Mmin]` tag; the prompt
+  tells Claude not to log a browser visit as work unless a github/commit/shell
+  line backs it up (a lone visit can still slip through the mechanical filter).
 - **SQLite quirks**: Brave locks its DB, so we query a `/tmp` copy. The empty
   string must be `''` (SQLite `""` is an identifier), so the query is fed over
   stdin — never through the shell.

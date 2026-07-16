@@ -18,6 +18,10 @@ module Noko
       ENV["ANTHROPIC_API_KEY"]
     end
 
+    def github_token
+      ENV["GITHUB_TOKEN"]
+    end
+
     private
 
     def load_env

@@ -6,7 +6,6 @@
 # treated as "work" activity. Everything else (x.com, youtube, etc.) is ignored.
 browser_domains:
   - atlassian.net
-  - github.com
   - nokotime
   - localhost
   - slite
